@@ -147,6 +147,9 @@ export function createStrategy(s: Settings = DEFAULT_SETTINGS): Bot {
 
   /** Which tier, if any, a launch qualifies for right now. 0 = none. */
   const tierOf = (l: Launch, now: number, realSol: number): 0 | 1 | 2 => {
+    // Defensive: realSol comes from Number(bigint)/1e9, so it should always be
+    // finite — but tiering must never run on a non-finite reserve value.
+    if (!Number.isFinite(realSol)) return 0;
     if (l.createdSlot === null || now - l.createdSlot > s.entryAgeSlots) return 0;
     if (l.entered || l.devSold) return 0;
     if (l.devBoughtLamports > BigInt(Math.floor(s.devBuyCeilingSol * LAMPORTS_PER_SOL))) return 0;
