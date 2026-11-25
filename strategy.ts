@@ -1,22 +1,22 @@
-// Cleanest-paper sniper for the pump.fun Sharpe sprint (agent-fun/replay/v2).
+// Pump.fun Sharpe sprint — "cleanest-paper sniper".
 //
-// The dev window is brutal for momentum: chasing breakouts loses ~9 SOL and
-// mean-reversion loses ~2 SOL, while buying fresh launches loses only ~0.1 SOL.
-// The edge is in *which* launches: a coin whose opening tape shows a tight
-// crowd — exactly two or three distinct non-creator buyers in its first few
-// slots, with the creator still holding — behaves far better than an empty
-// launch or a bundled one (four or more wallets in the opening slots is a
-// dump waiting to happen). So this bot only ever buys in a coin's first three
-// slots, only from that tight crowd, in two tiers: the three-buyer crowd gets
-// the full stake, the two-buyer crowd half. Everything else is risk control:
-// take profit at +25%, cut at -6%, never hold past 30 slots, leave the moment
-// the creator sells, the recent flow turns negative, or the coin goes quiet
-// (no trades for a while means the launch is dead and the slot is better used
-// elsewhere). Small stakes, quick exits, many coins: that is what a Sharpe
+// The dev window punishes chasing: breakout momentum loses about 9 SOL and
+// mean reversion about 2 SOL, while simply buying fresh launches loses only
+// ~0.1 SOL. The edge is selectivity. A launch whose opening tape shows a
+// tight crowd — exactly two or three distinct buyers who are not the
+// creator, with the creator still holding — behaves far better than an empty
+// launch or a bundled one (four-plus wallets in the opening slots is usually
+// a dump in waiting). So this bot only buys inside a coin's first three
+// slots, only out of that tight crowd, in two tiers: a three-buyer crowd
+// takes the full stake, a two-buyer crowd half. The rest is risk control:
+// bank at +25%, cut at -6%, never hold longer than 30 slots, walk away the
+// moment the creator sells, the recent flow turns negative, or the coin goes
+// quiet. Small stakes, fast exits, lots of coins — the shape a Sharpe
 // ranking rewards.
 //
-// Pure function of the batches the harness sends: no clock, no randomness,
-// no I/O, so the two graded executions produce byte-identical action logs.
+// The whole strategy is a pure function of the batches the harness sends:
+// no clock, no randomness, no I/O, so two graded executions produce
+// byte-identical action logs.
 
 import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/makefun-bot.ts';
 
@@ -78,87 +78,175 @@ export const DEFAULT_SETTINGS: Settings = {
   sellSlippageBps: 10_000,
 };
 
-interface OpeningTrade {
+/** One trade on a launch's opening tape. */
+interface TapeTrade {
   slot: number;
   buy: boolean;
-  solLamports: bigint;
-  user: Pubkey;
+  sol: bigint;
+  wallet: Pubkey;
 }
 
-interface Launch {
-  createdSlot: number | null;
-  creator: Pubkey | null;
-  /** Price at creation (virtual SOL per virtual token), for reference only. */
-  startPrice: number;
-  devBoughtLamports: bigint;
-  devSold: boolean;
+/** Everything remembered about one launch. */
+interface CoinTape {
+  /** Slot of the CreateEvent, null until the coin is created. */
+  createdAt: number | null;
+  maker: Pubkey | null;
+  /** Price at creation (virtual SOL per virtual token), reference only. */
+  creationPrice: number;
+  /** SOL the creator has bought themselves since creation. */
+  makerBought: bigint;
+  makerSold: boolean;
   /** Slot of the latest TradeEvent on this coin. */
-  lastTradeSlot: number;
-  buyers: Set<Pubkey>;
-  trades: OpeningTrade[];
-  entered: boolean;
+  lastTradeAt: number;
+  /** Distinct non-creator wallets that have bought. */
+  crowd: Set<Pubkey>;
+  tape: TapeTrade[];
+  /** True once this bot has bought the coin. */
+  bought: boolean;
 }
 
-interface Open {
-  enteredSlot: number;
-  bestValueLamports: bigint;
-  costLamports: bigint;
+/** A position this bot currently holds. */
+interface HeldPosition {
+  openedAt: number;
+  /** Best net value seen so far, kept for reference. */
+  peakValue: bigint;
+  /** Lamports paid for the entry (the stake). */
+  paid: bigint;
 }
 
-function priceOf(vq: bigint, vt: bigint): number {
-  return vt === 0n ? 0 : Number(vq) / Number(vt);
+/** Virtual price: quote reserves over token reserves, 0 when empty. */
+function creationPriceOf(quote: bigint, tokens: bigint): number {
+  return tokens === 0n ? 0 : Number(quote) / Number(tokens);
 }
 
 export function createStrategy(s: Settings = DEFAULT_SETTINGS): Bot {
-  const launches = new Map<Pubkey, Launch>();
-  const open = new Map<Pubkey, Open>();
-  const curveFeeBps =
-    95 + 30; // protocol + creator fallback bps; the harness fees match these on the dev window
+  const tapes = new Map<Pubkey, CoinTape>();
+  const held = new Map<Pubkey, HeldPosition>();
+  // Protocol fee plus creator fallback, in bps; the harness charges the same
+  // on the dev window, so exits are priced with these baked in.
+  const CURVE_FEE_BPS = 95 + 30;
 
-  const launchOf = (mint: Pubkey): Launch => {
-    let l = launches.get(mint);
-    if (l === undefined) {
-      l = {
-        createdSlot: null,
-        creator: null,
-        startPrice: 0,
-        devBoughtLamports: 0n,
-        devSold: false,
-        lastTradeSlot: -1,
-        buyers: new Set(),
-        trades: [],
-        entered: false,
-      };
-      launches.set(mint, l);
-    }
-    return l;
+  const tapeFor = (mint: Pubkey): CoinTape => {
+    const existing = tapes.get(mint);
+    if (existing !== undefined) return existing;
+    const fresh: CoinTape = {
+      createdAt: null,
+      maker: null,
+      creationPrice: 0,
+      makerBought: 0n,
+      makerSold: false,
+      lastTradeAt: -1,
+      crowd: new Set(),
+      tape: [],
+      bought: false,
+    };
+    tapes.set(mint, fresh);
+    return fresh;
   };
 
-  /** Net SOL (buys minus sells) over the last `window` slots of a launch's tape. */
-  const recentFlow = (l: Launch, now: number, window: number): bigint => {
+  /** Fold one batch of chain events into the per-coin tapes. */
+  const absorb = (batch: Batch): void => {
+    for (const e of batch.events) {
+      if (e.event === 'CreateEvent') {
+        const tape = tapeFor(e.mint);
+        tape.createdAt = e.slot;
+        tape.maker = e.creator;
+        tape.creationPrice = creationPriceOf(
+          BigInt(e.virtual_quote_reserves),
+          BigInt(e.virtual_token_reserves),
+        );
+      } else if (e.event === 'TradeEvent') {
+        const tape = tapeFor(e.mint);
+        const sol = BigInt(e.sol_amount);
+        tape.lastTradeAt = e.slot;
+        tape.tape.push({ slot: e.slot, buy: e.is_buy, sol, wallet: e.user });
+        if (tape.maker !== null && e.user === tape.maker) {
+          if (e.is_buy) tape.makerBought += sol;
+          else tape.makerSold = true;
+        } else if (e.is_buy) {
+          tape.crowd.add(e.user);
+        }
+      } else {
+        // CompleteEvent: the curve is finished; forget the tape so the coin
+        // can never be entered again.
+        tapes.delete(e.mint);
+      }
+    }
+  };
+
+  /** Net SOL (buys minus sells) over the last `span` slots of a tape. */
+  const netFlowOver = (tape: CoinTape, now: number, span: number): bigint => {
     let net = 0n;
-    for (let i = l.trades.length - 1; i >= 0; i--) {
-      const t = l.trades[i]!;
-      if (t.slot <= now - window) break;
-      net += t.buy ? t.solLamports : -t.solLamports;
+    for (let i = tape.tape.length - 1; i >= 0; i--) {
+      const trade = tape.tape[i]!;
+      if (trade.slot <= now - span) break;
+      net += trade.buy ? trade.sol : -trade.sol;
     }
     return net;
   };
 
-  /** Which tier, if any, a launch qualifies for right now. 0 = none. */
-  const tierOf = (l: Launch, now: number, realSol: number): 0 | 1 | 2 => {
-    // Defensive: realSol comes from Number(bigint)/1e9, so it should always be
-    // finite — but tiering must never run on a non-finite reserve value.
+  /**
+   * Which tier, if any, a launch qualifies for right now: 1 for the full
+   * stake, 2 for half, 0 for "do not buy".
+   */
+  const tierFor = (tape: CoinTape, now: number, realSol: number): 0 | 1 | 2 => {
+    // realSol comes from Number(bigint) / 1e9, so it should always be finite
+    // — but tiering must never run on a non-finite reserve value.
     if (!Number.isFinite(realSol)) return 0;
-    if (l.createdSlot === null || now - l.createdSlot > s.entryAgeSlots) return 0;
-    if (l.entered || l.devSold) return 0;
-    if (l.devBoughtLamports > BigInt(Math.floor(s.devBuyCeilingSol * LAMPORTS_PER_SOL))) return 0;
+    if (tape.createdAt === null || now - tape.createdAt > s.entryAgeSlots) return 0;
+    if (tape.bought || tape.makerSold) return 0;
+    if (tape.makerBought > BigInt(Math.floor(s.devBuyCeilingSol * LAMPORTS_PER_SOL))) return 0;
     if (realSol < s.reserveFloorSol || realSol > s.reserveCeilingSol) return 0;
-    if (l.trades.length < s.minOpeningTrades) return 0;
-    const crowd = l.buyers.size;
-    if (crowd === s.crowdA) return 1;
-    if (crowd === s.crowdB) return 2;
+    if (tape.tape.length < s.minOpeningTrades) return 0;
+    if (tape.crowd.size === s.crowdA) return 1;
+    if (tape.crowd.size === s.crowdB) return 2;
     return 0;
+  };
+
+  /**
+   * True when a held position should be sold now: take-profit or stop hit,
+   * held too long, creator sold, recent flow negative, or the coin gone
+   * quiet. `tape` is undefined once the launch tape was dropped.
+   */
+  const exitNow = (
+    tape: CoinTape | undefined,
+    openedAt: number,
+    value: bigint,
+    cost: bigint,
+    now: number,
+  ): boolean => {
+    const tookProfit =
+      value >= (cost * BigInt(Math.floor((1 + s.takeProfit) * 10_000))) / 10_000n;
+    const stoppedOut =
+      value <= (cost * BigInt(Math.floor((1 - s.stopLoss) * 10_000))) / 10_000n;
+    const tooOld = now - openedAt > s.maxHoldSlots;
+    const makerDumped = tape !== undefined && tape.makerSold;
+    const flowOut =
+      tape !== undefined && netFlowOver(tape, now, s.flowLookbackSlots) < 0n;
+    const goneQuiet = tape !== undefined && now - tape.lastTradeAt > s.staleSlots;
+    return tookProfit || stoppedOut || tooOld || makerDumped || flowOut || goneQuiet;
+  };
+
+  /**
+   * Lamports to spend on a tiered entry, or null when the buy is not worth
+   * placing: capped by the curve's max buy and by free cash after the tx
+   * fee, and dropped when below the minimum buy.
+   */
+  const sizeBuy = (
+    tier: 1 | 2,
+    mint: Pubkey,
+    freeLamports: bigint,
+    txFee: bigint,
+    state: BotState,
+  ): bigint | null => {
+    const wantSol = tier === 1 ? s.stakeASol : s.stakeBSol;
+    const want = BigInt(Math.floor(wantSol * LAMPORTS_PER_SOL));
+    const cap = state.maxBuyLamports(mint);
+    let amount = want < cap ? want : cap;
+    const affordable = freeLamports - txFee;
+    if (amount > affordable) amount = affordable;
+    if (amount < BigInt(Math.floor(s.minBuySol * LAMPORTS_PER_SOL))) return null;
+    return amount;
   };
 
   return {
@@ -168,89 +256,58 @@ export function createStrategy(s: Settings = DEFAULT_SETTINGS): Bot {
       const orders: OrderInput[] = [];
       const orderCap = state.hello.caps.max_orders_per_batch;
 
-      // Fold this batch's events into the launch tapes.
-      for (const e of batch.events) {
-        if (e.event === 'CreateEvent') {
-          const l = launchOf(e.mint);
-          l.createdSlot = e.slot;
-          l.creator = e.creator;
-          l.startPrice = priceOf(BigInt(e.virtual_quote_reserves), BigInt(e.virtual_token_reserves));
-        } else if (e.event === 'TradeEvent') {
-          const l = launchOf(e.mint);
-          const sol = BigInt(e.sol_amount);
-          l.lastTradeSlot = e.slot;
-          l.trades.push({ slot: e.slot, buy: e.is_buy, solLamports: sol, user: e.user });
-          if (l.creator !== null && e.user === l.creator) {
-            if (e.is_buy) l.devBoughtLamports += sol;
-            else l.devSold = true;
-          } else if (e.is_buy) {
-            l.buyers.add(e.user);
-          }
-        } else {
-          // CompleteEvent: the curve is done; drop its tape so it is never re-entered.
-          launches.delete(e.mint);
-        }
-      }
+      absorb(batch);
 
       const marks = new Map(batch.marks.map((m) => [m.mint, m] as const));
-      const pendingMints = new Set<Pubkey>();
-      for (const po of state.pending.values()) pendingMints.add(po.order.mint);
+      const pending = new Set<Pubkey>();
+      for (const po of state.pending.values()) pending.add(po.order.mint);
 
-      // Exits first: sell anything that hit its take-profit, stop, hold limit,
-      // creator sale, or a negative recent flow.
-      for (const [mint, o] of open) {
-        const pos = state.positions.get(mint);
-        if (pos === undefined) {
-          if (!pendingMints.has(mint)) open.delete(mint);
+      // Exits first: sell anything that hit its take-profit, stop, hold
+      // limit, creator sale, negative recent flow, or went quiet.
+      for (const [mint, pos] of held) {
+        const owned = state.positions.get(mint);
+        if (owned === undefined) {
+          if (!pending.has(mint)) held.delete(mint);
           continue;
         }
         const curve = state.curves.get(mint);
         if (curve === undefined || curve.complete) continue;
-        const mk = marks.get(mint);
-        const vq = mk ? BigInt(mk.virtual_quote_reserves) : curve.virtual_quote_reserves;
-        const vt = mk ? BigInt(mk.virtual_token_reserves) : curve.virtual_token_reserves;
-        const tokens = BigInt(pos.token_amount);
+        const mark = marks.get(mint);
+        // Price the exit off this batch's mark when the harness supplies
+        // one, otherwise off the live curve reserves — same quote either way.
+        const vq = mark ? BigInt(mark.virtual_quote_reserves) : curve.virtual_quote_reserves;
+        const vt = mark ? BigInt(mark.virtual_token_reserves) : curve.virtual_token_reserves;
+        const tokens = BigInt(owned.token_amount);
         const gross = (tokens * vq) / (vt + tokens);
-        const value = (gross * BigInt(10_000 - curveFeeBps)) / 10_000n - txFee;
-        const cost = BigInt(pos.cost_lamports);
-        if (value > o.bestValueLamports) o.bestValueLamports = value;
-        const l = launches.get(mint);
-        const devDumped = l !== undefined && l.devSold;
-        const flowOut = l !== undefined && recentFlow(l, now, s.flowLookbackSlots) < 0n;
-        const goneQuiet = l !== undefined && now - l.lastTradeSlot > s.staleSlots;
-        const stale = now - o.enteredSlot > s.maxHoldSlots;
-        const up = value >= (cost * BigInt(Math.floor((1 + s.takeProfit) * 10_000))) / 10_000n;
-        const down = value <= (cost * BigInt(Math.floor((1 - s.stopLoss) * 10_000))) / 10_000n;
-        if (!up && !down && !stale && !devDumped && !flowOut && !goneQuiet) continue;
-        if (pendingMints.has(mint)) continue;
+        const value = (gross * BigInt(10_000 - CURVE_FEE_BPS)) / 10_000n - txFee;
+        const cost = BigInt(owned.cost_lamports);
+        if (value > pos.peakValue) pos.peakValue = value;
+        if (!exitNow(tapes.get(mint), pos.openedAt, value, cost, now)) continue;
+        if (pending.has(mint)) continue;
         if (orders.length >= orderCap) break;
-        orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: s.sellSlippageBps });
+        orders.push({ side: 'sell', mint, token_amount: owned.token_amount, max_slippage_bps: s.sellSlippageBps });
       }
 
-      // Entries: one fresh launch per batch at most is plenty; walk the tapes in
-      // first-seen order so the run is deterministic.
+      // Entries: walk the tapes in first-seen order so the run stays
+      // deterministic. One fresh launch per batch is plenty in practice —
+      // the room and cash checks below enforce it naturally.
       let freeLamports = state.freeCashLamports();
       let room = state.hello.caps.max_open_positions - state.committedPositionCount();
-      for (const [mint, l] of launches) {
+      for (const [mint, tape] of tapes) {
         if (orders.length >= orderCap || room <= 0) break;
-        if (open.has(mint) || pendingMints.has(mint)) continue;
+        if (held.has(mint) || pending.has(mint)) continue;
         const curve = state.curves.get(mint);
         if (curve === undefined || curve.complete) continue;
         const realSol = Number(curve.real_quote_reserves) / LAMPORTS_PER_SOL;
-        const tier = tierOf(l, now, realSol);
+        const tier = tierFor(tape, now, realSol);
         if (tier === 0) continue;
-        const wantSol = tier === 1 ? s.stakeASol : s.stakeBSol;
-        const want = BigInt(Math.floor(wantSol * LAMPORTS_PER_SOL));
-        const cap = state.maxBuyLamports(mint);
-        let amount = want < cap ? want : cap;
-        const affordable = freeLamports - txFee;
-        if (amount > affordable) amount = affordable;
-        if (amount < BigInt(Math.floor(s.minBuySol * LAMPORTS_PER_SOL))) continue;
+        const amount = sizeBuy(tier, mint, freeLamports, txFee, state);
+        if (amount === null) continue;
         orders.push({ side: 'buy', mint, quote_lamports: amount, max_slippage_bps: s.buySlippageBps });
         freeLamports -= amount + txFee;
         room -= 1;
-        l.entered = true;
-        open.set(mint, { enteredSlot: now, bestValueLamports: 0n, costLamports: amount });
+        tape.bought = true;
+        held.set(mint, { openedAt: now, peakValue: 0n, paid: amount });
       }
       return orders;
     },
